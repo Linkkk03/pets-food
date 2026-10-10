@@ -1,0 +1,454 @@
+
+# 加载必要的包
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(car)          # 用于方差分析
+library(ggpubr)       # 用于统计检验标注
+library(corrplot)     # 用于相关性可视化
+library(nnet)         # 用于多项逻辑回归
+library(broom)        # 用于整理模型结果
+
+# 设置主题和随机种子
+theme_set(theme_minimal(base_size = 12))
+set.seed(123)
+
+
+# 一、数据准备与预处理
+
+# 读取数据
+data <- read.csv("C:/Users/Linkk/Desktop/R/宠物食品分析/pet_food_customer_orders.csv", stringsAsFactors = FALSE)
+
+# 数据清洗与衍生变量创建
+data <- data %>%
+  mutate(across(where(is.factor), as.character))
+data <- data %>%
+  mutate(
+    across(where(is.numeric), ~ replace_na(.x, 0)),
+    across(where(is.character), ~ replace_na(.x, "None"))
+  )
+
+processed_data <- data %>%
+  # 处理日期字段
+  mutate(
+    pet_signup_datetime = as.POSIXct(pet_signup_datetime, format = "%Y-%m-%d %H:%M:%S"),
+    order_payment_date = as.Date(order_payment_date),
+    last_customer_support_ticket_date = as.POSIXct(
+      ifelse(last_customer_support_ticket_date == "", 
+             NA, 
+             last_customer_support_ticket_date),
+      format = "%Y-%m-%d %H:%M:%S"
+    )
+  ) %>%
+  # 处理逻辑和因子变量
+  mutate(
+    pet_has_active_subscription = as.logical(pet_has_active_subscription),
+    neutered = as.logical(neutered),
+    ate_wet_food_pre_tails = as.logical(ate_wet_food_pre_tails),
+    
+    # 分类变量因子化
+    gender = factor(gender, levels = c("male", "female")),
+    pet_breed_size = factor(pet_breed_size, levels = c("small", "medium", "large","giant","toy")),
+    pet_food_tier = factor(pet_food_tier, levels = c("mid", "premium", "superpremium")),
+    signup_promo = factor(signup_promo),
+    pet_life_stage_at_order = factor(pet_life_stage_at_order),
+    customer_support_ticket_category = factor(customer_support_ticket_category),
+    
+    # 健康与偏好标志
+    has_health_issues = !is.na(pet_health_issue_list) & pet_health_issue_list != "",
+    has_allergens = !is.na(pet_allergen_list) & pet_allergen_list != "",
+    has_fav_flavor = !is.na(pet_fav_flavour_list) & pet_fav_flavour_list != "",
+    has_customer_support = !is.na(last_customer_support_ticket_date),
+    
+    # 湿粮质地处理
+    texture_type = case_when(
+      grepl("gravy", wet_food_textures_in_order, ignore.case = TRUE) ~ "gravy",
+      grepl("jelly", wet_food_textures_in_order, ignore.case = TRUE) ~ "jelly",
+      grepl("pate", wet_food_textures_in_order, ignore.case = TRUE) ~ "pate",
+      wet_food_textures_in_order == "" | is.na(wet_food_textures_in_order) ~ "none",
+      TRUE ~ "other"
+    ),
+    texture_type = factor(texture_type, levels = c("none", "gravy", "jelly", "pate", "other")),
+    
+    # 折扣分组
+    discount_group = case_when(
+      is.na(wet_food_discount_percent) | wet_food_discount_percent == 0 ~ "无折扣",
+      wet_food_discount_percent > 0 & wet_food_discount_percent <= 10 ~ "低折扣(1-10%)",
+      wet_food_discount_percent > 10 & wet_food_discount_percent <= 20 ~ "中折扣(11-20%)",
+      wet_food_discount_percent > 20 ~ "高折扣(>20%)",
+      TRUE ~ "无折扣"
+    ),
+    discount_group = factor(discount_group),
+    
+    # 订单类型分类
+    order_type = case_when(
+      kibble_kcal > 0 & wet_kcal == 0 ~ "纯干粮",
+      kibble_kcal == 0 & wet_kcal > 0 ~ "纯湿粮",
+      kibble_kcal > 0 & wet_kcal > 0 ~ "混合订单",
+      TRUE ~ "其他"
+    ),
+    order_type = factor(order_type, levels = c("纯干粮", "纯湿粮", "混合订单", "其他")),
+    
+    # 计算湿粮比例
+    wet_calorie_ratio = ifelse(total_order_kcal > 0, 
+                               wet_kcal / total_order_kcal, 
+                               0)
+  ) %>%
+  # 移除无效数据
+  filter(!is.na(kibble_kcal) & !is.na(wet_kcal) & total_order_kcal > 0)
+
+# 3. 创建宠物级别的聚合数据
+
+pet_level_data <- processed_data %>%
+  group_by(pet_id, customer_id) %>%
+  summarise(
+    # 基本特征
+    pet_breed_size = first(pet_breed_size),
+    gender = first(gender),
+    neutered = first(neutered),
+    pet_food_tier = first(pet_food_tier),
+    has_health_issues = first(has_health_issues),
+    has_allergens = first(has_allergens),
+    has_fav_flavor = first(has_fav_flavor),
+    subscription_active = first(pet_has_active_subscription),
+    
+    # 购买行为
+    total_orders = n(),
+    total_dry_kcal = sum(kibble_kcal, na.rm = TRUE),
+    total_wet_kcal = sum(wet_kcal, na.rm = TRUE),
+    total_kcal = sum(total_order_kcal, na.rm = TRUE),
+    avg_wet_ratio = mean(wet_calorie_ratio, na.rm = TRUE),
+    
+    # 订单类型统计
+    dry_only_orders = sum(order_type == "纯干粮"),
+    wet_only_orders = sum(order_type == "纯湿粮"),
+    mixed_orders = sum(order_type == "混合订单"),
+    
+    # 质地偏好
+    texture_preference = names(sort(table(texture_type[texture_type != "none"]), 
+                                    decreasing = TRUE))[1],
+    texture_preference = ifelse(is.na(texture_preference), "none", texture_preference),
+    
+    # 促销使用
+    avg_discount = mean(wet_food_discount_percent, na.rm = TRUE),
+    used_discount = any(!is.na(wet_food_discount_percent) & 
+                          wet_food_discount_percent > 0),
+    
+    # 互动行为
+    total_web_sessions = sum(total_web_sessions, na.rm = TRUE),
+    total_website_minutes = sum(total_minutes_on_website, na.rm = TRUE),
+    has_customer_support = first(has_customer_support),
+    
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    # 主要消费类型
+    primary_order_type = case_when(
+      wet_only_orders == total_orders ~ "纯湿粮消费者",
+      dry_only_orders == total_orders ~ "纯干粮消费者",
+      mixed_orders > 0 ~ "混合型消费者",
+      TRUE ~ "其他"
+    ),
+    primary_order_type = factor(primary_order_type),
+    
+    # 湿粮采纳程度
+    wet_food_adoption = case_when(
+      total_wet_kcal == 0 ~ "未采纳",
+      avg_wet_ratio < 0.25 ~ "轻度采纳(<25%)",
+      avg_wet_ratio >= 0.25 & avg_wet_ratio < 0.75 ~ "中度采纳(25-75%)",
+      avg_wet_ratio >= 0.75 ~ "重度采纳(>=75%)",
+      TRUE ~ "未采纳"
+    ),
+    wet_food_adoption = factor(wet_food_adoption),
+    
+    # 互动强度分组
+    engagement_level = case_when(
+      total_web_sessions == 0 ~ "无互动",
+      total_web_sessions <= median(total_web_sessions[total_web_sessions > 0], 
+                                   na.rm = TRUE) ~ "低互动",
+      total_web_sessions > median(total_web_sessions[total_web_sessions > 0], 
+                                  na.rm = TRUE) ~ "高互动",
+      TRUE ~ "无互动"
+    )
+  )
+
+cat(sprintf("订单数据: %d 行\n", nrow(processed_data)))
+cat(sprintf("宠物数据: %d 只\n", nrow(pet_level_data)))
+
+
+# 二、描述性统计与卡路里对比
+
+# 1. 订单类型分布
+order_type_dist <- processed_data %>%
+  group_by(order_type) %>%
+  summarise(
+    count = n(),
+    percentage = n() / nrow(processed_data) * 100,
+    .groups = 'drop'
+  )
+print(order_type_dist)
+
+# 可视化订单类型分布
+p1 <- ggplot(order_type_dist, aes(x = reorder(order_type, -percentage), y = percentage, fill = order_type)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = sprintf("%.1f%%\n(n=%d)", percentage, count)), 
+            vjust = -0.3, size = 4) +
+  labs(
+    title = "订单类型分布",
+    x = "订单类型",
+    y = "百分比 (%)",
+    fill = "订单类型"
+  ) +
+  scale_fill_brewer(palette = "Set2") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+  ) +
+  ylim(0, max(order_type_dist$percentage) * 1.1)
+
+print(p1)
+
+# 2. 干粮与湿粮卡路里描述性统计
+
+calorie_stats <- processed_data %>%
+  summarise(
+    # 干粮统计
+    dry_mean = mean(kibble_kcal, na.rm = TRUE),
+    dry_median = median(kibble_kcal, na.rm = TRUE),
+    dry_sd = sd(kibble_kcal, na.rm = TRUE),
+    dry_min = min(kibble_kcal, na.rm = TRUE),
+    dry_max = max(kibble_kcal, na.rm = TRUE),
+    
+    # 湿粮统计
+    wet_mean = mean(wet_kcal, na.rm = TRUE),
+    wet_median = median(wet_kcal, na.rm = TRUE),
+    wet_sd = sd(wet_kcal, na.rm = TRUE),
+    wet_min = min(wet_kcal, na.rm = TRUE),
+    wet_max = max(wet_kcal, na.rm = TRUE),
+    
+    # 总卡路里统计
+    total_mean = mean(total_order_kcal, na.rm = TRUE),
+    total_median = median(total_order_kcal, na.rm = TRUE),
+    
+    # 湿粮比例
+    wet_ratio_mean = mean(wet_calorie_ratio, na.rm = TRUE) * 100
+  )
+
+cat(sprintf(" 干粮—— 均值: %.1f, 中位数: %.1f, 标准差: %.1f\n", 
+            calorie_stats$dry_mean, calorie_stats$dry_median, calorie_stats$dry_sd))
+
+cat(sprintf(" 湿粮—— 均值: %.1f, 中位数: %.1f, 标准差: %.1f\n", 
+            calorie_stats$wet_mean, calorie_stats$wet_median, calorie_stats$wet_sd))
+
+cat(sprintf("\n湿粮占总热量平均比例: %.1f%%\n", calorie_stats$wet_ratio_mean))
+
+# 3. 卡路里分布可视化
+# 准备长格式数据用于绘图
+calorie_long <- processed_data %>%
+  select(kibble_kcal, wet_kcal) %>%
+  pivot_longer(cols = everything(), names_to = "food_type", values_to = "calories") %>%
+  mutate(
+    food_type = factor(food_type, 
+                       levels = c("kibble_kcal", "wet_kcal"),
+                       labels = c("干粮", "湿粮"))
+  )
+
+# 箱线图比较
+p2 <- ggplot(calorie_long, aes(x = food_type, y = calories, fill = food_type)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 1, outlier.color = "red") +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4, color = "black") +
+  labs(
+    title = "干粮与湿粮卡路里分布对比",
+    subtitle = "箱线图展示（黑钻表示均值）",
+    x = "食品类型",
+    y = "卡路里 (kcal)",
+    fill = "食品类型"
+  ) +
+  scale_fill_manual(values = c("干粮" = "#4E79A7", "湿粮" = "#F28E2B")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray50", size = 11),
+    legend.position = "top"
+  )
+
+# 密度图比较
+p3 <- ggplot(calorie_long, aes(x = calories, fill = food_type)) +
+  geom_density(alpha = 0.5, adjust = 1.5) +
+  labs(
+    title = "干粮与湿粮卡路里密度分布",
+    x = "卡路里 (kcal)",
+    y = "密度",
+    fill = "食品类型"
+  ) +
+  scale_fill_manual(values = c("干粮" = "#4E79A7", "湿粮" = "#F28E2B")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    legend.position = "top"
+  ) +
+  facet_wrap(~food_type, scales = "free_y", ncol = 1)
+
+# 显示图表
+print(p2)
+print(p3)
+
+# 4. 卡路里差异显著性检验
+
+library(nortest)
+# 正态性检验
+ad_dry <- ad.test(processed_data$kibble_kcal)
+ad_wet <- ad.test(processed_data$wet_kcal)
+
+cat(sprintf("  干粮: A = %.4f, p = %.4f\n", 
+            ad_dry$statistic, ad_dry$p.value))
+cat(sprintf("  湿粮: A = %.4f, p = %.4f\n", 
+            ad_wet$statistic, ad_wet$p.value))
+#可视化
+par(mfrow = c(1, 2))
+qqnorm(processed_data$kibble_kcal, main = "干粮 QQ图")
+qqline(processed_data$kibble_kcal, col = "red")
+qqnorm(processed_data$wet_kcal, main = "湿粮 QQ图")
+qqline(processed_data$wet_kcal, col = "red")
+
+# 根据正态性结果选择检验方法
+if (ad_dry$p.value > 0.05 && ad_wet$p.value > 0.05) {
+  # 符合正态分布，使用t检验
+  t_test_result <- t.test(processed_data$kibble_kcal, processed_data$wet_kcal, 
+                          alternative = "two.sided")
+  cat("\n独立样本t检验结果:\n")
+  cat(sprintf("  t = %.4f, df = %.1f, p = %.4f\n", 
+              t_test_result$statistic, t_test_result$parameter, 
+              t_test_result$p.value))
+} else {
+  # 不符合正态分布，使用Wilcoxon检验
+  wilcox_result <- wilcox.test(processed_data$kibble_kcal, processed_data$wet_kcal, 
+                               alternative = "two.sided")
+  cat("\nMann-Whitney U检验结果:\n")
+  cat(sprintf("  W = %.0f, p = %.4f\n", 
+              wilcox_result$statistic, wilcox_result$p.value))
+}
+
+
+# 三、湿粮质地影响分析
+
+# 1. 湿粮质地分布
+texture_dist <- processed_data %>%
+  filter(wet_kcal > 0) %>%  # 仅分析包含湿粮的订单
+  group_by(texture_type) %>%
+  summarise(
+    orders = n(),
+    percentage = n() / nrow(filter(processed_data, wet_kcal > 0)) * 100,
+    avg_wet_kcal = mean(wet_kcal, na.rm = TRUE),
+    avg_wet_ratio = mean(wet_calorie_ratio, na.rm = TRUE) * 100,
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(orders))
+
+print(texture_dist)
+
+# 2. 质地与湿粮购买关系的可视化
+p4 <- ggplot(texture_dist, aes(x = reorder(texture_type, -orders), y = orders, fill = texture_type)) +
+  geom_bar(stat = "identity", alpha = 0.8) +
+  geom_text(aes(label = sprintf("%.1f%%\n(n=%d)", percentage, orders)), 
+            vjust = -0.3, size = 4) +
+  labs(
+    title = "湿粮质地偏好分布",
+    subtitle = "仅包含湿粮的订单",
+    x = "湿粮质地类型",
+    y = "订单数量",
+    fill = "质地类型"
+  ) +
+  scale_fill_brewer(palette = "Set3") +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    plot.subtitle = element_text(hjust = 0.5, color = "gray50", size = 11),
+    legend.position = "none",
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  ) +
+  ylim(0, max(texture_dist$orders) * 1.1)
+
+print(p4)
+
+
+# 四、干湿粮消费关系分析
+
+# 1. 市场格局分析（宠物级别）
+cat("\n1. 市场格局（宠物消费类型）:\n")
+pet_market_seg <- pet_level_data %>%
+  group_by(primary_order_type) %>%
+  summarise(
+    pets = n(),
+    percentage = n() / nrow(pet_level_data) * 100,
+    avg_total_kcal = mean(total_kcal, na.rm = TRUE),
+    avg_orders = mean(total_orders, na.rm = TRUE),
+    .groups = 'drop'
+  ) %>%
+  arrange(desc(pets))
+
+print(pet_market_seg)
+
+# 2. 干湿粮相关性分析
+
+# (1) 订单层面的相关性（仅混合订单）
+mixed_orders <- processed_data %>%
+  filter(order_type == "混合订单")
+
+if (nrow(mixed_orders) > 0) {
+  cor_order_level <- cor.test(mixed_orders$kibble_kcal, mixed_orders$wet_kcal, 
+                              method = "pearson")
+  
+  cat("\n(1) 订单层面相关性（仅混合订单）:\n")
+  cat(sprintf("  相关系数 r = %.4f\n", cor_order_level$estimate))
+  cat(sprintf("  95%%置信区间: [%.4f, %.4f]\n", 
+              cor_order_level$conf.int[1], cor_order_level$conf.int[2]))
+  cat(sprintf("  p-value = %.4f\n", cor_order_level$p.value))
+  
+  # 可视化
+  p5 <- ggplot(mixed_orders, aes(x = kibble_kcal, y = wet_kcal)) +
+    geom_point(alpha = 0.5, color = "steelblue") +
+    geom_smooth(method = "lm", se = TRUE, color = "darkred", linetype = "dashed") +
+    labs(
+      title = "混合订单中干湿粮卡路里相关性",
+      subtitle = sprintf("Pearson r = %.3f, p = %.3f", 
+                         cor_order_level$estimate, cor_order_level$p.value),
+      x = "干粮卡路里 (kcal)",
+      y = "湿粮卡路里 (kcal)"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+      plot.subtitle = element_text(hjust = 0.5, color = "gray50", size = 11)
+    )
+  
+  print(p5)
+}
+
+# (2) 宠物层面的相关性
+cor_pet_level <- cor.test(pet_level_data$total_dry_kcal, 
+                          pet_level_data$total_wet_kcal, 
+                          method = "pearson")
+
+cat("\n(2) 宠物层面相关性（总消费量）:\n")
+cat(sprintf("  相关系数 r = %.4f\n", cor_pet_level$estimate))
+cat(sprintf("  95%%置信区间: [%.4f, %.4f]\n", 
+            cor_pet_level$conf.int[1], cor_pet_level$conf.int[2]))
+cat(sprintf("  p-value = %.4f\n", cor_pet_level$p.value))
+
+# 3. 关系判断
+cat("\n3. 干湿粮关系判断:\n")
+if (cor_pet_level$p.value < 0.05) {
+  if (cor_pet_level$estimate > 0) {
+    cat("  结论：干粮与湿粮呈显著正相关，表明二者是互补关系。\n")
+    cat("  解释：宠物主倾向于同时购买或增加一种的同时也增加另一种。\n")
+  } else if (cor_pet_level$estimate < 0) {
+    cat("  结论：干粮与湿粮呈显著负相关，表明二者是替代关系。\n")
+    cat("  解释：宠物主倾向于在两者间进行取舍。\n")
+  }
+} else {
+  cat("  结论：干粮与湿粮无显著相关性，表明二者可能是独立决策。\n")
+}
+
